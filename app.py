@@ -158,12 +158,30 @@ st.info(
 # --------------------------------------------------------------------------- #
 # 1. Arquivo de doses + ficha
 # --------------------------------------------------------------------------- #
-st.header("1. Enviar o arquivo de doses")
-arquivo = st.file_uploader("Arquivo de vacinação (Excel .xlsx/.xls ou CSV)", type=["xlsx", "xls", "csv"], key="up_doses")
-if not arquivo:
-    st.info("Envie o arquivo para começar. Nenhum dado é preenchido pelo painel: tudo vem do que você enviar.")
+st.header("1. Enviar o(s) arquivo(s) de doses")
+arquivos = st.file_uploader(
+    "Arquivo(s) de vacinação (Excel .xlsx/.xls ou CSV). Envie um arquivo por cidade ou um só com várias cidades.",
+    type=["xlsx", "xls", "csv"], key="up_doses", accept_multiple_files=True)
+if not arquivos:
+    st.info("Envie o(s) arquivo(s) para começar. Nenhum dado é preenchido pelo painel: tudo vem do que você enviar.")
     st.stop()
-doses_arq = carregar_arquivo("doses", arquivo)
+nomes_enviados = [a.name for a in arquivos]
+nomes_repetidos = sorted({n for n in nomes_enviados if nomes_enviados.count(n) > 1})
+if nomes_repetidos:
+    st.error("Há arquivos com o mesmo nome: " + ", ".join(nomes_repetidos) + ". Renomeie para continuar.")
+    st.stop()
+lista = []                      # um item por arquivo enviado
+for i, a in enumerate(arquivos):
+    with st.container(border=True):
+        st.markdown(f"#### Arquivo {i + 1}: `{a.name}`")
+        lista.append(carregar_arquivo(f"doses{i}", a))
+doses_arq = lista[0]
+k_todos = "+".join(x["k"] for x in lista)   # identifica este conjunto de arquivos nas caixas da tela
+for i in range(len(lista)):
+    for j in range(i + 1, len(lista)):
+        if lista[i]["tabela"].equals(lista[j]["tabela"]):
+            st.warning(f"Os arquivos «{lista[i]['nome']}» e «{lista[j]['nome']}» têm conteúdo idêntico. "
+                       "Se forem o mesmo arquivo enviado duas vezes, os valores serão contados em dobro.")
 
 with st.container(border=True):
     st.markdown("**Ficha do arquivo** (o que você sabe sobre ele; aparece nos resultados e no CSV). "
@@ -173,18 +191,22 @@ with st.container(border=True):
                           help="Ex.: nome do sistema/painel e link. O painel não sabe disso sozinho.")
     extracao = f2.text_input("Data de extração", key="extracao", placeholder="dd/mm/aaaa")
     g1, g2 = st.columns(2)
-    dica = core.dica_tipo_municipio(doses_arq["nome"])
+    dicas = {d for d in (core.dica_tipo_municipio(x["nome"]) for x in lista) if d}
+    if len(dicas) > 1:
+        st.warning("Pelos nomes, os arquivos parecem misturar **residência** e **ocorrência**. "
+                   "Analise cada critério separadamente: o painel não mistura os dois.")
+    dica = next(iter(dicas)) if len(dicas) == 1 else None
     rot_criterio = {"residencia": "Município de residência (onde a pessoa mora)",
                     "ocorrencia": "Município de ocorrência (onde a dose foi aplicada)",
                     "nao_sei": "Não sei / não informado"}
     ordem = ["residencia", "ocorrencia", "nao_sei"]
     criterio = g1.selectbox("A coluna de município deste arquivo é de…", ordem, format_func=rot_criterio.get,
-                            index=ordem.index(dica) if dica else 2, key=f"crit_{doses_arq['k']}",
+                            index=ordem.index(dica) if dica else 2, key=f"crit_{k_todos}",
                             help="O painel só sugere pelo nome do arquivo. Confirme na documentação da fonte.")
     if dica:
         g1.caption(f"Sugestão pelo nome do arquivo: {rot_criterio[dica].split(' (')[0]}.")
     unidade_decl = g2.selectbox("Cada número (ou cada linha) deste arquivo representa…",
-                                ["doses aplicadas", "pessoas vacinadas", "ainda não sei"], index=2, key=f"un_{doses_arq['k']}",
+                                ["doses aplicadas", "pessoas vacinadas", "ainda não sei"], index=2, key=f"un_{k_todos}",
                                 help="Doses e pessoas são coisas diferentes: uma pessoa pode receber mais de uma dose.")
 criterio_txt = {"residencia": "residência", "ocorrencia": "ocorrência", "nao_sei": ind.NAO_INFORMADO}[criterio]
 
@@ -194,11 +216,13 @@ criterio_txt = {"residencia": "residência", "ocorrencia": "ocorrência", "nao_s
 st.header("2. Conferir as colunas")
 st.caption("O painel sugere colunas pelo nome e pelo conteúdo. **Confirme ou corrija.** "
            "Se uma informação não existe no arquivo, deixe «não existe» – os filtros dela não aparecerão.")
-tipos = doses_arq["tipos"]
+tipos = doses_arq["tipos"]      # sugestões feitas a partir do primeiro arquivo
+if len(lista) > 1:
+    st.info("As colunas escolhidas abaixo valem para **todos** os arquivos: eles precisam ter essas colunas com os mesmos nomes.")
 nomes_col = list(tipos)
 papeis = ["municipio", "codigo", "faixa_etaria", "dose", "vacina", "periodo", "quantidade"]
 sug = core.sugerir_colunas(tipos, papeis)
-k = doses_arq["k"]
+k = k_todos
 c1, c2, c3 = st.columns(3)
 with c1:
     col_mun = escolher_coluna("Município", nomes_col, sug["municipio"], f"c_mun_{k}")
@@ -226,7 +250,22 @@ if criterio != "nao_sei" and col_mun and (core.dica_tipo_municipio(col_mun) not 
 mapa = {"municipio": col_mun, "codigo": col_cod, "faixa": col_faixa, "dose": col_dose, "vacina": col_vac,
         "periodo": col_per, "quantidade": col_qtd}
 mapa = {papel: col for papel, col in mapa.items() if col}
-base_total, log = ind.preparar_base(doses_arq["tabela"], mapa, tipos)
+partes, logs = [], {}           # uma parte (e um log de qualidade) por arquivo
+for i, a in enumerate(lista):
+    faltam = [c for c in escolhidas if c not in a["tabela"].columns]
+    if faltam:
+        st.error(f"O arquivo «{a['nome']}» não tem a(s) coluna(s): {', '.join(faltam)}. Todos os arquivos precisam ter as colunas "
+                 "escolhidas, com os mesmos nomes. Renomeie a coluna no arquivo ou analise esse arquivo separadamente.")
+        st.stop()
+    parte, log_arq = ind.preparar_base(a["tabela"], mapa, a["tipos"])
+    if not col_mun:   # arquivo de uma cidade só, sem coluna de município: quem diz o município é você
+        nome_mun = st.text_input(f"Município do arquivo «{a['nome']}» (ele não tem coluna de município)",
+                                 key=f"munarq_{k_todos}_{i}")
+        parte["municipio"] = nome_mun.strip() or ind.NAO_INFORMADO
+    parte["arquivo"] = a["nome"]
+    partes.append(parte)
+    logs[a["nome"]] = log_arq
+base_total = pd.concat(partes, ignore_index=True)
 
 # Linhas de total/subtotal
 eh_total = ind.linhas_de_total(base_total)
@@ -358,15 +397,19 @@ with tab_dados:
                     "Os números devem ser iguais.")
 
     with st.expander("🧼 Qualidade dos dados"):
-        st.markdown(f"- Linhas de dados lidas: **{len(doses_arq['tabela'])}** · linhas vazias ignoradas: "
-                    f"**{doses_arq['info'].empty_rows_dropped}** · colunas vazias ignoradas: **{doses_arq['info'].empty_cols_dropped}**")
+        for a in lista:
+            st.markdown(f"- Arquivo «{a['nome']}»: linhas de dados lidas: **{len(a['tabela'])}** · linhas vazias ignoradas: "
+                        f"**{a['info'].empty_rows_dropped}** · colunas vazias ignoradas: **{a['info'].empty_cols_dropped}**")
         st.markdown(f"- Linhas de total/subtotal: **{int(eh_total.sum())}** "
                     f"({'ignoradas' if ignorar_totais else 'mantidas'})")
         if len(linhas_ignoradas):
             mostrar_tabela(linhas_ignoradas)
-        for papel, info_col in log.items():
+        itens_log = [(nome_arq, papel, info_col) for nome_arq, lg in logs.items() for papel, info_col in lg.items()]
+        for nome_arq, papel, info_col in itens_log:
             nome_p = {"municipio": "Município", "codigo": "Código", "faixa": "Faixa etária", "dose": "Dose", "vacina": "Vacina",
                       "periodo": "Período", "quantidade": "Quantidade"}[papel]
+            if len(logs) > 1:
+                nome_p = f"{nome_p} – {nome_arq}"
             if papel == "quantidade":
                 if info_col.get("coluna"):
                     st.markdown(f"- **{nome_p}**: {info_col['vazios']} vazio(s) (ausente ≠ zero), {info_col['nao_convertidos']} "
@@ -661,7 +704,7 @@ with tab_cob:
 with tab_ficha:
     st.markdown("### Ficha dos dados")
     ficha = pd.DataFrame([
-        ("Arquivo de doses", doses_arq["nome"]),
+        ("Arquivo(s) de doses", ", ".join(nomes_enviados)),
         ("Fonte", ou_nao_informado(fonte)),
         ("Data de extração", ou_nao_informado(extracao)),
         ("Critério do município", criterio_txt),
